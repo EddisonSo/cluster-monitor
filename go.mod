@@ -3,6 +3,7 @@ module eddisonso.com/cluster-monitor
 go 1.22
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	k8s.io/api v0.29.0
 	k8s.io/apimachinery v0.29.0
 	k8s.io/client-go v0.29.0

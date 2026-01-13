@@ -6,8 +6,10 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,13 +18,13 @@ import (
 )
 
 type NodeMetrics struct {
-	Name           string  `json:"name"`
-	CPUUsage       string  `json:"cpu_usage"`
-	MemoryUsage    string  `json:"memory_usage"`
-	CPUCapacity    string  `json:"cpu_capacity"`
-	MemoryCapacity string  `json:"memory_capacity"`
-	CPUPercent     float64 `json:"cpu_percent"`
-	MemoryPercent  float64 `json:"memory_percent"`
+	Name           string          `json:"name"`
+	CPUUsage       string          `json:"cpu_usage"`
+	MemoryUsage    string          `json:"memory_usage"`
+	CPUCapacity    string          `json:"cpu_capacity"`
+	MemoryCapacity string          `json:"memory_capacity"`
+	CPUPercent     float64         `json:"cpu_percent"`
+	MemoryPercent  float64         `json:"memory_percent"`
 	Conditions     []NodeCondition `json:"conditions,omitempty"`
 }
 
@@ -50,6 +52,12 @@ type metricsNode struct {
 	} `json:"usage"`
 }
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	flag.Parse()
@@ -68,6 +76,10 @@ func main() {
 		handleClusterInfo(w, r, clientset)
 	})
 
+	http.HandleFunc("/ws/cluster-info", func(w http.ResponseWriter, r *http.Request) {
+		handleClusterInfoWS(w, r, clientset)
+	})
+
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -77,32 +89,26 @@ func main() {
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 
-func handleClusterInfo(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
+func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*ClusterInfo, error) {
 	// Get node metrics from metrics-server
 	metricsData, err := clientset.RESTClient().
 		Get().
 		AbsPath("/apis/metrics.k8s.io/v1beta1/nodes").
 		DoRaw(ctx)
 	if err != nil {
-		http.Error(w, "Failed to get metrics: "+err.Error(), http.StatusBadGateway)
-		return
+		return nil, err
 	}
 
 	// Get node info for capacity and conditions
 	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		http.Error(w, "Failed to get nodes: "+err.Error(), http.StatusBadGateway)
-		return
+		return nil, err
 	}
 
 	// Parse metrics response
 	var metricsResponse metricsNodeList
 	if err := json.Unmarshal(metricsData, &metricsResponse); err != nil {
-		http.Error(w, "Failed to parse metrics: "+err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 
 	// Build capacity and conditions map
@@ -159,11 +165,78 @@ func handleClusterInfo(w http.ResponseWriter, r *http.Request, clientset *kubern
 		})
 	}
 
-	response := ClusterInfo{
+	return &ClusterInfo{
 		Timestamp: time.Now(),
 		Nodes:     nodeMetrics,
+	}, nil
+}
+
+func handleClusterInfo(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	info, err := getClusterInfo(ctx, clientset)
+	if err != nil {
+		http.Error(w, "Failed to get cluster info: "+err.Error(), http.StatusBadGateway)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(info)
+}
+
+func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	// Read pump - handle close and pings
+	go func() {
+		defer close(done)
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Send initial data immediately
+	sendClusterInfo(conn, &mu, clientset)
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := sendClusterInfo(conn, &mu, clientset); err != nil {
+				log.Printf("WebSocket send failed: %v", err)
+				return
+			}
+		}
+	}
+}
+
+func sendClusterInfo(conn *websocket.Conn, mu *sync.Mutex, clientset *kubernetes.Clientset) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	info, err := getClusterInfo(ctx, clientset)
+	if err != nil {
+		log.Printf("Failed to get cluster info: %v", err)
+		return nil // Don't close connection on transient errors
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	return conn.WriteJSON(info)
 }
