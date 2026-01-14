@@ -20,14 +20,16 @@ import (
 )
 
 type NodeMetrics struct {
-	Name           string          `json:"name"`
-	CPUUsage       string          `json:"cpu_usage"`
-	MemoryUsage    string          `json:"memory_usage"`
-	CPUCapacity    string          `json:"cpu_capacity"`
-	MemoryCapacity string          `json:"memory_capacity"`
-	CPUPercent     float64         `json:"cpu_percent"`
-	MemoryPercent  float64         `json:"memory_percent"`
-	Conditions     []NodeCondition `json:"conditions,omitempty"`
+	Name             string          `json:"name"`
+	CPUUsage         string          `json:"cpu_usage"`
+	MemoryUsage      string          `json:"memory_usage"`
+	CPUCapacity      string          `json:"cpu_capacity"`
+	MemoryCapacity   string          `json:"memory_capacity"`
+	CPUPercent       float64         `json:"cpu_percent"`
+	MemoryPercent    float64         `json:"memory_percent"`
+	DiskCapacity     int64           `json:"disk_capacity"`
+	DiskAllocatable  int64           `json:"disk_allocatable"`
+	Conditions       []NodeCondition `json:"conditions,omitempty"`
 }
 
 type NodeCondition struct {
@@ -147,6 +149,8 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 
 		cpuCapacity := node.Status.Capacity.Cpu()
 		memCapacity := node.Status.Capacity.Memory()
+		diskCapacity := node.Status.Capacity.StorageEphemeral()
+		diskAllocatable := node.Status.Allocatable.StorageEphemeral()
 
 		cpuUsage := resource.MustParse(item.Usage.CPU)
 		memUsage := resource.MustParse(item.Usage.Memory)
@@ -174,14 +178,16 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 		}
 
 		nodeMetrics = append(nodeMetrics, NodeMetrics{
-			Name:           item.Metadata.Name,
-			CPUUsage:       item.Usage.CPU,
-			MemoryUsage:    item.Usage.Memory,
-			CPUCapacity:    cpuCapacity.String(),
-			MemoryCapacity: memCapacity.String(),
-			CPUPercent:     cpuPercent,
-			MemoryPercent:  memPercent,
-			Conditions:     conditions,
+			Name:            item.Metadata.Name,
+			CPUUsage:        item.Usage.CPU,
+			MemoryUsage:     item.Usage.Memory,
+			CPUCapacity:     cpuCapacity.String(),
+			MemoryCapacity:  memCapacity.String(),
+			CPUPercent:      cpuPercent,
+			MemoryPercent:   memPercent,
+			DiskCapacity:    diskCapacity.Value(),
+			DiskAllocatable: diskAllocatable.Value(),
+			Conditions:      conditions,
 		})
 	}
 
