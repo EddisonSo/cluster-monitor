@@ -63,12 +63,13 @@ var upgrader = websocket.Upgrader{
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	logServiceAddr := flag.String("log-service", "", "Log service address (e.g., log-service:50051)")
+	logSource := flag.String("log-source", "cluster-monitor", "Log source name (e.g., pod name)")
 	flag.Parse()
 
 	// Initialize logger
 	if *logServiceAddr != "" {
 		logger := gfslog.NewLogger(gfslog.Config{
-			Source:         "cluster-monitor",
+			Source:         *logSource,
 			LogServiceAddr: *logServiceAddr,
 			MinLevel:       slog.LevelDebug,
 		})
