@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
+	"eddisonso.com/go-gfs/pkg/gfslog"
 	"github.com/gorilla/websocket"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -60,16 +62,30 @@ var upgrader = websocket.Upgrader{
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
+	logServiceAddr := flag.String("log-service", "", "Log service address (e.g., log-service:50051)")
 	flag.Parse()
+
+	// Initialize logger
+	if *logServiceAddr != "" {
+		logger := gfslog.NewLogger(gfslog.Config{
+			Source:         "cluster-monitor",
+			LogServiceAddr: *logServiceAddr,
+			MinLevel:       slog.LevelDebug,
+		})
+		slog.SetDefault(logger.Logger)
+		defer logger.Close()
+	}
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Fatalf("Failed to get in-cluster config: %v", err)
+		slog.Error("Failed to get in-cluster config", "error", err)
+		os.Exit(1)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Failed to create clientset: %v", err)
+		slog.Error("Failed to create clientset", "error", err)
+		os.Exit(1)
 	}
 
 	http.HandleFunc("/cluster-info", func(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +101,11 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	log.Printf("Cluster monitor listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	slog.Info("Cluster monitor listening", "addr", *addr)
+	if err := http.ListenAndServe(*addr, nil); err != nil {
+		slog.Error("HTTP server failed", "error", err)
+		os.Exit(1)
+	}
 }
 
 func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*ClusterInfo, error) {
@@ -188,7 +207,7 @@ func handleClusterInfo(w http.ResponseWriter, r *http.Request, clientset *kubern
 func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
+		slog.Error("WebSocket upgrade failed", "error", err)
 		return
 	}
 	defer conn.Close()
@@ -219,7 +238,7 @@ func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kube
 			return
 		case <-ticker.C:
 			if err := sendClusterInfo(conn, &mu, clientset); err != nil {
-				log.Printf("WebSocket send failed: %v", err)
+				slog.Error("WebSocket send failed", "error", err)
 				return
 			}
 		}
@@ -232,7 +251,7 @@ func sendClusterInfo(conn *websocket.Conn, mu *sync.Mutex, clientset *kubernetes
 
 	info, err := getClusterInfo(ctx, clientset)
 	if err != nil {
-		log.Printf("Failed to get cluster info: %v", err)
+		slog.Error("Failed to get cluster info", "error", err)
 		return nil // Don't close connection on transient errors
 	}
 

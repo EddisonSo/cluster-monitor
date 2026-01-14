@@ -22,7 +22,16 @@ jobs:
             suffix: amd64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout cluster-monitor
+        uses: actions/checkout@v4
+        with:
+          path: cluster-monitor
+
+      - name: Checkout go-gfs
+        uses: actions/checkout@v4
+        with:
+          repository: EddisonSo/go-gfs
+          path: go-gfs
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -38,6 +47,7 @@ jobs:
           docker buildx build \
             --platform ${{ matrix.platform }} \
             -t ${IMAGE}:${GITHUB_SHA}-${{ matrix.suffix }} \
+            -f cluster-monitor/Dockerfile \
             --provenance=false \
             --sbom=false \
             --push .
