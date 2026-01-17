@@ -20,17 +20,17 @@ import (
 )
 
 type NodeMetrics struct {
-	Name            string          `json:"name"`
-	CPUUsage        string          `json:"cpu_usage"`
-	MemoryUsage     string          `json:"memory_usage"`
-	CPUCapacity     string          `json:"cpu_capacity"`
-	MemoryCapacity  string          `json:"memory_capacity"`
-	CPUPercent      float64         `json:"cpu_percent"`
-	MemoryPercent   float64         `json:"memory_percent"`
-	DiskCapacity    int64           `json:"disk_capacity"`
-	DiskUsage       int64           `json:"disk_usage"`
-	DiskPercent     float64         `json:"disk_percent"`
-	Conditions      []NodeCondition `json:"conditions,omitempty"`
+	Name           string          `json:"name"`
+	CPUUsage       string          `json:"cpu_usage"`
+	MemoryUsage    string          `json:"memory_usage"`
+	CPUCapacity    string          `json:"cpu_capacity"`
+	MemoryCapacity string          `json:"memory_capacity"`
+	CPUPercent     float64         `json:"cpu_percent"`
+	MemoryPercent  float64         `json:"memory_percent"`
+	DiskCapacity   int64           `json:"disk_capacity"`
+	DiskUsage      int64           `json:"disk_usage"`
+	DiskPercent    float64         `json:"disk_percent"`
+	Conditions     []NodeCondition `json:"conditions,omitempty"`
 }
 
 type NodeCondition struct {
@@ -44,17 +44,87 @@ type ClusterInfo struct {
 }
 
 type PodMetrics struct {
-	Name        string  `json:"name"`
-	Namespace   string  `json:"namespace"`
-	Node        string  `json:"node"`
-	CPUUsage    int64   `json:"cpu_usage"`     // nanocores
-	MemoryUsage int64   `json:"memory_usage"`  // bytes
-	DiskUsage   int64   `json:"disk_usage"`    // bytes (ephemeral storage)
+	Name        string `json:"name"`
+	Namespace   string `json:"namespace"`
+	Node        string `json:"node"`
+	CPUUsage    int64  `json:"cpu_usage"`
+	MemoryUsage int64  `json:"memory_usage"`
+	DiskUsage   int64  `json:"disk_usage"`
 }
 
 type PodMetricsInfo struct {
 	Timestamp time.Time    `json:"timestamp"`
 	Pods      []PodMetrics `json:"pods"`
+}
+
+// MetricsCache holds the latest metrics data updated by background workers
+type MetricsCache struct {
+	mu          sync.RWMutex
+	clusterInfo *ClusterInfo
+	podMetrics  *PodMetricsInfo
+	subscribers []chan *ClusterInfo
+	subMu       sync.Mutex
+}
+
+func NewMetricsCache() *MetricsCache {
+	return &MetricsCache{
+		clusterInfo: &ClusterInfo{Timestamp: time.Now()},
+		podMetrics:  &PodMetricsInfo{Timestamp: time.Now()},
+	}
+}
+
+func (c *MetricsCache) GetClusterInfo() *ClusterInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clusterInfo
+}
+
+func (c *MetricsCache) SetClusterInfo(info *ClusterInfo) {
+	c.mu.Lock()
+	c.clusterInfo = info
+	c.mu.Unlock()
+
+	// Notify subscribers
+	c.subMu.Lock()
+	for _, ch := range c.subscribers {
+		select {
+		case ch <- info:
+		default: // Don't block if subscriber is slow
+		}
+	}
+	c.subMu.Unlock()
+}
+
+func (c *MetricsCache) GetPodMetrics() *PodMetricsInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.podMetrics
+}
+
+func (c *MetricsCache) SetPodMetrics(info *PodMetricsInfo) {
+	c.mu.Lock()
+	c.podMetrics = info
+	c.mu.Unlock()
+}
+
+func (c *MetricsCache) Subscribe() chan *ClusterInfo {
+	ch := make(chan *ClusterInfo, 1)
+	c.subMu.Lock()
+	c.subscribers = append(c.subscribers, ch)
+	c.subMu.Unlock()
+	return ch
+}
+
+func (c *MetricsCache) Unsubscribe(ch chan *ClusterInfo) {
+	c.subMu.Lock()
+	defer c.subMu.Unlock()
+	for i, sub := range c.subscribers {
+		if sub == ch {
+			c.subscribers = append(c.subscribers[:i], c.subscribers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
 }
 
 type metricsNodeList struct {
@@ -71,7 +141,6 @@ type metricsNode struct {
 	} `json:"usage"`
 }
 
-// kubeletStats represents the response from kubelet's /stats/summary endpoint
 type kubeletStats struct {
 	Node struct {
 		Fs struct {
@@ -93,7 +162,6 @@ type kubeletPodStats struct {
 	} `json:"ephemeral-storage,omitempty"`
 }
 
-// metricsPodList represents the response from metrics-server for pods
 type metricsPodList struct {
 	Items []metricsPod `json:"items"`
 }
@@ -112,127 +180,7 @@ type metricsPod struct {
 	} `json:"containers"`
 }
 
-// getNodeDiskStats fetches disk usage from kubelet stats/summary endpoint
-func getNodeDiskStats(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) (capacity, used int64, err error) {
-	data, err := clientset.RESTClient().
-		Get().
-		AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
-		DoRaw(ctx)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	var stats kubeletStats
-	if err := json.Unmarshal(data, &stats); err != nil {
-		return 0, 0, err
-	}
-
-	return stats.Node.Fs.CapacityBytes, stats.Node.Fs.UsedBytes, nil
-}
-
 const coreServicesNamespace = "default"
-
-// getPodMetrics fetches CPU, memory, and disk usage for pods in the core services namespace
-func getPodMetrics(ctx context.Context, clientset *kubernetes.Clientset) (*PodMetricsInfo, error) {
-	// Get pod metrics from metrics-server for the namespace
-	metricsData, err := clientset.RESTClient().
-		Get().
-		AbsPath("/apis/metrics.k8s.io/v1beta1/namespaces/" + coreServicesNamespace + "/pods").
-		DoRaw(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var metricsResponse metricsPodList
-	if err := json.Unmarshal(metricsData, &metricsResponse); err != nil {
-		return nil, err
-	}
-
-	// Get pod info to find which node each pod is on
-	pods, err := clientset.CoreV1().Pods(coreServicesNamespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	// Build map of pod name -> node name
-	podToNode := make(map[string]string)
-	for _, pod := range pods.Items {
-		podToNode[pod.Name] = pod.Spec.NodeName
-	}
-
-	// Get unique nodes that have our pods
-	nodeSet := make(map[string]bool)
-	for _, nodeName := range podToNode {
-		if nodeName != "" {
-			nodeSet[nodeName] = true
-		}
-	}
-
-	// Fetch kubelet stats from each node in parallel to get disk usage per pod
-	podDiskUsage := make(map[string]int64) // key: "namespace/name"
-	var podDiskMu sync.Mutex
-	var wg sync.WaitGroup
-	for nodeName := range nodeSet {
-		wg.Add(1)
-		go func(nodeName string) {
-			defer wg.Done()
-			data, err := clientset.RESTClient().
-				Get().
-				AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
-				DoRaw(ctx)
-			if err != nil {
-				slog.Warn("Failed to get kubelet stats", "node", nodeName, "error", err)
-				return
-			}
-
-			var stats kubeletStats
-			if err := json.Unmarshal(data, &stats); err != nil {
-				return
-			}
-
-			podDiskMu.Lock()
-			for _, podStat := range stats.Pods {
-				if podStat.PodRef.Namespace != coreServicesNamespace {
-					continue
-				}
-				key := podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
-				if podStat.EphemeralStorage != nil {
-					podDiskUsage[key] = podStat.EphemeralStorage.UsedBytes
-				}
-			}
-			podDiskMu.Unlock()
-		}(nodeName)
-	}
-	wg.Wait()
-
-	// Build response
-	var podMetrics []PodMetrics
-	for _, item := range metricsResponse.Items {
-		// Sum CPU and memory across all containers
-		var totalCPU, totalMemory int64
-		for _, container := range item.Containers {
-			cpu := resource.MustParse(container.Usage.CPU)
-			mem := resource.MustParse(container.Usage.Memory)
-			totalCPU += cpu.MilliValue() * 1000000 // convert to nanocores
-			totalMemory += mem.Value()
-		}
-
-		key := item.Metadata.Namespace + "/" + item.Metadata.Name
-		podMetrics = append(podMetrics, PodMetrics{
-			Name:        item.Metadata.Name,
-			Namespace:   item.Metadata.Namespace,
-			Node:        podToNode[item.Metadata.Name],
-			CPUUsage:    totalCPU,
-			MemoryUsage: totalMemory,
-			DiskUsage:   podDiskUsage[key],
-		})
-	}
-
-	return &PodMetricsInfo{
-		Timestamp: time.Now(),
-		Pods:      podMetrics,
-	}, nil
-}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -246,7 +194,6 @@ func main() {
 	logSource := flag.String("log-source", "cluster-monitor", "Log source name (e.g., pod name)")
 	flag.Parse()
 
-	// Initialize logger
 	if *logServiceAddr != "" {
 		logger := gfslog.NewLogger(gfslog.Config{
 			Source:         *logSource,
@@ -269,17 +216,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize cache and start background workers
+	cache := NewMetricsCache()
+	go clusterInfoWorker(clientset, cache)
+	go podMetricsWorker(clientset, cache)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cluster-info", func(w http.ResponseWriter, r *http.Request) {
-		handleClusterInfo(w, r, clientset)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cache.GetClusterInfo())
 	})
 
 	mux.HandleFunc("/ws/cluster-info", func(w http.ResponseWriter, r *http.Request) {
-		handleClusterInfoWS(w, r, clientset)
+		handleClusterInfoWS(w, r, cache)
 	})
 
 	mux.HandleFunc("/pod-metrics", func(w http.ResponseWriter, r *http.Request) {
-		handlePodMetrics(w, r, clientset)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cache.GetPodMetrics())
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +241,6 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	// CORS middleware
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
@@ -310,29 +263,45 @@ func main() {
 	}
 }
 
-func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*ClusterInfo, error) {
+// clusterInfoWorker fetches cluster metrics every 5 seconds
+func clusterInfoWorker(clientset *kubernetes.Clientset, cache *MetricsCache) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Fetch immediately on start
+	fetchClusterInfo(clientset, cache)
+
+	for range ticker.C {
+		fetchClusterInfo(clientset, cache)
+	}
+}
+
+func fetchClusterInfo(clientset *kubernetes.Clientset, cache *MetricsCache) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Get node metrics from metrics-server
 	metricsData, err := clientset.RESTClient().
 		Get().
 		AbsPath("/apis/metrics.k8s.io/v1beta1/nodes").
 		DoRaw(ctx)
 	if err != nil {
-		return nil, err
+		slog.Error("Failed to get node metrics", "error", err)
+		return
 	}
 
-	// Get node info for capacity and conditions
 	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, err
+		slog.Error("Failed to list nodes", "error", err)
+		return
 	}
 
-	// Parse metrics response
 	var metricsResponse metricsNodeList
 	if err := json.Unmarshal(metricsData, &metricsResponse); err != nil {
-		return nil, err
+		slog.Error("Failed to parse metrics", "error", err)
+		return
 	}
 
-	// Build capacity and conditions map
 	nodeInfo := make(map[string]*corev1.Node)
 	for i := range nodes.Items {
 		nodeInfo[nodes.Items[i].Name] = &nodes.Items[i]
@@ -346,15 +315,28 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 	diskStatsMap := make(map[string]diskStats)
 	var diskMu sync.Mutex
 	var wg sync.WaitGroup
+
 	for _, item := range metricsResponse.Items {
 		wg.Add(1)
 		go func(nodeName string) {
 			defer wg.Done()
-			if cap, used, err := getNodeDiskStats(ctx, clientset, nodeName); err == nil {
-				diskMu.Lock()
-				diskStatsMap[nodeName] = diskStats{capacity: cap, usage: used}
-				diskMu.Unlock()
+			data, err := clientset.RESTClient().
+				Get().
+				AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
+				DoRaw(ctx)
+			if err != nil {
+				return
 			}
+			var stats kubeletStats
+			if err := json.Unmarshal(data, &stats); err != nil {
+				return
+			}
+			diskMu.Lock()
+			diskStatsMap[nodeName] = diskStats{
+				capacity: stats.Node.Fs.CapacityBytes,
+				usage:    stats.Node.Fs.UsedBytes,
+			}
+			diskMu.Unlock()
 		}(item.Metadata.Name)
 	}
 	wg.Wait()
@@ -369,7 +351,6 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 
 		cpuCapacity := node.Status.Capacity.Cpu()
 		memCapacity := node.Status.Capacity.Memory()
-
 		cpuUsage := resource.MustParse(item.Usage.CPU)
 		memUsage := resource.MustParse(item.Usage.Memory)
 
@@ -383,7 +364,6 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 			memPercent = float64(memUsage.Value()) / float64(memCapacity.Value()) * 100
 		}
 
-		// Get disk stats from parallel fetch
 		var diskCapacity, diskUsage int64
 		var diskPercent float64
 		if ds, ok := diskStatsMap[item.Metadata.Name]; ok {
@@ -394,7 +374,6 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 			}
 		}
 
-		// Get relevant conditions (pressure indicators)
 		var conditions []NodeCondition
 		for _, cond := range node.Status.Conditions {
 			switch cond.Type {
@@ -421,27 +400,127 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 		})
 	}
 
-	return &ClusterInfo{
+	cache.SetClusterInfo(&ClusterInfo{
 		Timestamp: time.Now(),
 		Nodes:     nodeMetrics,
-	}, nil
+	})
 }
 
-func handleClusterInfo(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+// podMetricsWorker fetches pod metrics every 5 seconds
+func podMetricsWorker(clientset *kubernetes.Clientset, cache *MetricsCache) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Fetch immediately on start
+	fetchPodMetrics(clientset, cache)
+
+	for range ticker.C {
+		fetchPodMetrics(clientset, cache)
+	}
+}
+
+func fetchPodMetrics(clientset *kubernetes.Clientset, cache *MetricsCache) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	info, err := getClusterInfo(ctx, clientset)
+	metricsData, err := clientset.RESTClient().
+		Get().
+		AbsPath("/apis/metrics.k8s.io/v1beta1/namespaces/" + coreServicesNamespace + "/pods").
+		DoRaw(ctx)
 	if err != nil {
-		http.Error(w, "Failed to get cluster info: "+err.Error(), http.StatusBadGateway)
+		slog.Error("Failed to get pod metrics", "error", err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	var metricsResponse metricsPodList
+	if err := json.Unmarshal(metricsData, &metricsResponse); err != nil {
+		slog.Error("Failed to parse pod metrics", "error", err)
+		return
+	}
+
+	pods, err := clientset.CoreV1().Pods(coreServicesNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		slog.Error("Failed to list pods", "error", err)
+		return
+	}
+
+	podToNode := make(map[string]string)
+	for _, pod := range pods.Items {
+		podToNode[pod.Name] = pod.Spec.NodeName
+	}
+
+	nodeSet := make(map[string]bool)
+	for _, nodeName := range podToNode {
+		if nodeName != "" {
+			nodeSet[nodeName] = true
+		}
+	}
+
+	// Fetch kubelet stats in parallel
+	podDiskUsage := make(map[string]int64)
+	var podDiskMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for nodeName := range nodeSet {
+		wg.Add(1)
+		go func(nodeName string) {
+			defer wg.Done()
+			data, err := clientset.RESTClient().
+				Get().
+				AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
+				DoRaw(ctx)
+			if err != nil {
+				return
+			}
+
+			var stats kubeletStats
+			if err := json.Unmarshal(data, &stats); err != nil {
+				return
+			}
+
+			podDiskMu.Lock()
+			for _, podStat := range stats.Pods {
+				if podStat.PodRef.Namespace != coreServicesNamespace {
+					continue
+				}
+				key := podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
+				if podStat.EphemeralStorage != nil {
+					podDiskUsage[key] = podStat.EphemeralStorage.UsedBytes
+				}
+			}
+			podDiskMu.Unlock()
+		}(nodeName)
+	}
+	wg.Wait()
+
+	var podMetrics []PodMetrics
+	for _, item := range metricsResponse.Items {
+		var totalCPU, totalMemory int64
+		for _, container := range item.Containers {
+			cpu := resource.MustParse(container.Usage.CPU)
+			mem := resource.MustParse(container.Usage.Memory)
+			totalCPU += cpu.MilliValue() * 1000000
+			totalMemory += mem.Value()
+		}
+
+		key := item.Metadata.Namespace + "/" + item.Metadata.Name
+		podMetrics = append(podMetrics, PodMetrics{
+			Name:        item.Metadata.Name,
+			Namespace:   item.Metadata.Namespace,
+			Node:        podToNode[item.Metadata.Name],
+			CPUUsage:    totalCPU,
+			MemoryUsage: totalMemory,
+			DiskUsage:   podDiskUsage[key],
+		})
+	}
+
+	cache.SetPodMetrics(&PodMetricsInfo{
+		Timestamp: time.Now(),
+		Pods:      podMetrics,
+	})
 }
 
-func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
+func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, cache *MetricsCache) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("WebSocket upgrade failed", "error", err)
@@ -449,10 +528,13 @@ func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kube
 	}
 	defer conn.Close()
 
-	var mu sync.Mutex
+	// Subscribe to updates
+	updates := cache.Subscribe()
+	defer cache.Unsubscribe(updates)
+
 	done := make(chan struct{})
 
-	// Read pump - handle close and pings
+	// Read pump - handle close
 	go func() {
 		defer close(done)
 		for {
@@ -463,50 +545,21 @@ func handleClusterInfoWS(w http.ResponseWriter, r *http.Request, clientset *kube
 		}
 	}()
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Send current data immediately
+	if err := conn.WriteJSON(cache.GetClusterInfo()); err != nil {
+		return
+	}
 
-	// Send initial data immediately
-	sendClusterInfo(conn, &mu, clientset)
-
+	// Send updates as they come in
 	for {
 		select {
 		case <-done:
 			return
-		case <-ticker.C:
-			if err := sendClusterInfo(conn, &mu, clientset); err != nil {
+		case info := <-updates:
+			if err := conn.WriteJSON(info); err != nil {
 				slog.Error("WebSocket send failed", "error", err)
 				return
 			}
 		}
 	}
-}
-
-func sendClusterInfo(conn *websocket.Conn, mu *sync.Mutex, clientset *kubernetes.Clientset) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	info, err := getClusterInfo(ctx, clientset)
-	if err != nil {
-		slog.Error("Failed to get cluster info", "error", err)
-		return nil // Don't close connection on transient errors
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	return conn.WriteJSON(info)
-}
-
-func handlePodMetrics(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	info, err := getPodMetrics(ctx, clientset)
-	if err != nil {
-		http.Error(w, "Failed to get pod metrics: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
 }
