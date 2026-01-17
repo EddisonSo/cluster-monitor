@@ -190,6 +190,7 @@ var upgrader = websocket.Upgrader{
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
+	refreshInterval := flag.Duration("refresh", 5*time.Second, "Metrics refresh interval")
 	logServiceAddr := flag.String("log-service", "", "Log service address (e.g., log-service:50051)")
 	logSource := flag.String("log-source", "cluster-monitor", "Log source name (e.g., pod name)")
 	flag.Parse()
@@ -218,8 +219,8 @@ func main() {
 
 	// Initialize cache and start background workers
 	cache := NewMetricsCache()
-	go clusterInfoWorker(clientset, cache)
-	go podMetricsWorker(clientset, cache)
+	go clusterInfoWorker(clientset, cache, *refreshInterval)
+	go podMetricsWorker(clientset, cache, *refreshInterval)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cluster-info", func(w http.ResponseWriter, r *http.Request) {
@@ -263,9 +264,9 @@ func main() {
 	}
 }
 
-// clusterInfoWorker fetches cluster metrics every 5 seconds
-func clusterInfoWorker(clientset *kubernetes.Clientset, cache *MetricsCache) {
-	ticker := time.NewTicker(5 * time.Second)
+// clusterInfoWorker fetches cluster metrics at the configured interval
+func clusterInfoWorker(clientset *kubernetes.Clientset, cache *MetricsCache, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Fetch immediately on start
@@ -406,9 +407,9 @@ func fetchClusterInfo(clientset *kubernetes.Clientset, cache *MetricsCache) {
 	})
 }
 
-// podMetricsWorker fetches pod metrics every 5 seconds
-func podMetricsWorker(clientset *kubernetes.Clientset, cache *MetricsCache) {
-	ticker := time.NewTicker(5 * time.Second)
+// podMetricsWorker fetches pod metrics at the configured interval
+func podMetricsWorker(clientset *kubernetes.Clientset, cache *MetricsCache, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Fetch immediately on start
