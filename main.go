@@ -20,16 +20,17 @@ import (
 )
 
 type NodeMetrics struct {
-	Name             string          `json:"name"`
-	CPUUsage         string          `json:"cpu_usage"`
-	MemoryUsage      string          `json:"memory_usage"`
-	CPUCapacity      string          `json:"cpu_capacity"`
-	MemoryCapacity   string          `json:"memory_capacity"`
-	CPUPercent       float64         `json:"cpu_percent"`
-	MemoryPercent    float64         `json:"memory_percent"`
-	DiskCapacity     int64           `json:"disk_capacity"`
-	DiskAllocatable  int64           `json:"disk_allocatable"`
-	Conditions       []NodeCondition `json:"conditions,omitempty"`
+	Name            string          `json:"name"`
+	CPUUsage        string          `json:"cpu_usage"`
+	MemoryUsage     string          `json:"memory_usage"`
+	CPUCapacity     string          `json:"cpu_capacity"`
+	MemoryCapacity  string          `json:"memory_capacity"`
+	CPUPercent      float64         `json:"cpu_percent"`
+	MemoryPercent   float64         `json:"memory_percent"`
+	DiskCapacity    int64           `json:"disk_capacity"`
+	DiskUsage       int64           `json:"disk_usage"`
+	DiskPercent     float64         `json:"disk_percent"`
+	Conditions      []NodeCondition `json:"conditions,omitempty"`
 }
 
 type NodeCondition struct {
@@ -40,6 +41,20 @@ type NodeCondition struct {
 type ClusterInfo struct {
 	Timestamp time.Time     `json:"timestamp"`
 	Nodes     []NodeMetrics `json:"nodes"`
+}
+
+type PodMetrics struct {
+	Name        string  `json:"name"`
+	Namespace   string  `json:"namespace"`
+	Node        string  `json:"node"`
+	CPUUsage    int64   `json:"cpu_usage"`     // nanocores
+	MemoryUsage int64   `json:"memory_usage"`  // bytes
+	DiskUsage   int64   `json:"disk_usage"`    // bytes (ephemeral storage)
+}
+
+type PodMetricsInfo struct {
+	Timestamp time.Time    `json:"timestamp"`
+	Pods      []PodMetrics `json:"pods"`
 }
 
 type metricsNodeList struct {
@@ -54,6 +69,160 @@ type metricsNode struct {
 		CPU    string `json:"cpu"`
 		Memory string `json:"memory"`
 	} `json:"usage"`
+}
+
+// kubeletStats represents the response from kubelet's /stats/summary endpoint
+type kubeletStats struct {
+	Node struct {
+		Fs struct {
+			CapacityBytes  int64 `json:"capacityBytes"`
+			UsedBytes      int64 `json:"usedBytes"`
+			AvailableBytes int64 `json:"availableBytes"`
+		} `json:"fs"`
+	} `json:"node"`
+	Pods []kubeletPodStats `json:"pods"`
+}
+
+type kubeletPodStats struct {
+	PodRef struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"podRef"`
+	EphemeralStorage *struct {
+		UsedBytes int64 `json:"usedBytes"`
+	} `json:"ephemeral-storage,omitempty"`
+}
+
+// metricsPodList represents the response from metrics-server for pods
+type metricsPodList struct {
+	Items []metricsPod `json:"items"`
+}
+
+type metricsPod struct {
+	Metadata struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"metadata"`
+	Containers []struct {
+		Name  string `json:"name"`
+		Usage struct {
+			CPU    string `json:"cpu"`
+			Memory string `json:"memory"`
+		} `json:"usage"`
+	} `json:"containers"`
+}
+
+// getNodeDiskStats fetches disk usage from kubelet stats/summary endpoint
+func getNodeDiskStats(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) (capacity, used int64, err error) {
+	data, err := clientset.RESTClient().
+		Get().
+		AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
+		DoRaw(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var stats kubeletStats
+	if err := json.Unmarshal(data, &stats); err != nil {
+		return 0, 0, err
+	}
+
+	return stats.Node.Fs.CapacityBytes, stats.Node.Fs.UsedBytes, nil
+}
+
+const coreServicesNamespace = "default"
+
+// getPodMetrics fetches CPU, memory, and disk usage for pods in the core services namespace
+func getPodMetrics(ctx context.Context, clientset *kubernetes.Clientset) (*PodMetricsInfo, error) {
+	// Get pod metrics from metrics-server for the namespace
+	metricsData, err := clientset.RESTClient().
+		Get().
+		AbsPath("/apis/metrics.k8s.io/v1beta1/namespaces/" + coreServicesNamespace + "/pods").
+		DoRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var metricsResponse metricsPodList
+	if err := json.Unmarshal(metricsData, &metricsResponse); err != nil {
+		return nil, err
+	}
+
+	// Get pod info to find which node each pod is on
+	pods, err := clientset.CoreV1().Pods(coreServicesNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Build map of pod name -> node name
+	podToNode := make(map[string]string)
+	for _, pod := range pods.Items {
+		podToNode[pod.Name] = pod.Spec.NodeName
+	}
+
+	// Get unique nodes that have our pods
+	nodeSet := make(map[string]bool)
+	for _, nodeName := range podToNode {
+		if nodeName != "" {
+			nodeSet[nodeName] = true
+		}
+	}
+
+	// Fetch kubelet stats from each node to get disk usage per pod
+	podDiskUsage := make(map[string]int64) // key: "namespace/name"
+	for nodeName := range nodeSet {
+		data, err := clientset.RESTClient().
+			Get().
+			AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
+			DoRaw(ctx)
+		if err != nil {
+			slog.Warn("Failed to get kubelet stats", "node", nodeName, "error", err)
+			continue
+		}
+
+		var stats kubeletStats
+		if err := json.Unmarshal(data, &stats); err != nil {
+			continue
+		}
+
+		for _, podStat := range stats.Pods {
+			if podStat.PodRef.Namespace != coreServicesNamespace {
+				continue
+			}
+			key := podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
+			if podStat.EphemeralStorage != nil {
+				podDiskUsage[key] = podStat.EphemeralStorage.UsedBytes
+			}
+		}
+	}
+
+	// Build response
+	var podMetrics []PodMetrics
+	for _, item := range metricsResponse.Items {
+		// Sum CPU and memory across all containers
+		var totalCPU, totalMemory int64
+		for _, container := range item.Containers {
+			cpu := resource.MustParse(container.Usage.CPU)
+			mem := resource.MustParse(container.Usage.Memory)
+			totalCPU += cpu.MilliValue() * 1000000 // convert to nanocores
+			totalMemory += mem.Value()
+		}
+
+		key := item.Metadata.Namespace + "/" + item.Metadata.Name
+		podMetrics = append(podMetrics, PodMetrics{
+			Name:        item.Metadata.Name,
+			Namespace:   item.Metadata.Namespace,
+			Node:        podToNode[item.Metadata.Name],
+			CPUUsage:    totalCPU,
+			MemoryUsage: totalMemory,
+			DiskUsage:   podDiskUsage[key],
+		})
+	}
+
+	return &PodMetricsInfo{
+		Timestamp: time.Now(),
+		Pods:      podMetrics,
+	}, nil
 }
 
 var upgrader = websocket.Upgrader{
@@ -98,6 +267,10 @@ func main() {
 
 	mux.HandleFunc("/ws/cluster-info", func(w http.ResponseWriter, r *http.Request) {
 		handleClusterInfoWS(w, r, clientset)
+	})
+
+	mux.HandleFunc("/pod-metrics", func(w http.ResponseWriter, r *http.Request) {
+		handlePodMetrics(w, r, clientset)
 	})
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -166,8 +339,6 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 
 		cpuCapacity := node.Status.Capacity.Cpu()
 		memCapacity := node.Status.Capacity.Memory()
-		diskCapacity := node.Status.Capacity.StorageEphemeral()
-		diskAllocatable := node.Status.Allocatable.StorageEphemeral()
 
 		cpuUsage := resource.MustParse(item.Usage.CPU)
 		memUsage := resource.MustParse(item.Usage.Memory)
@@ -180,6 +351,17 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 		memPercent := 0.0
 		if memCapacity.Value() > 0 {
 			memPercent = float64(memUsage.Value()) / float64(memCapacity.Value()) * 100
+		}
+
+		// Fetch disk stats from kubelet
+		var diskCapacity, diskUsage int64
+		var diskPercent float64
+		if cap, used, err := getNodeDiskStats(ctx, clientset, item.Metadata.Name); err == nil {
+			diskCapacity = cap
+			diskUsage = used
+			if diskCapacity > 0 {
+				diskPercent = float64(diskUsage) / float64(diskCapacity) * 100
+			}
 		}
 
 		// Get relevant conditions (pressure indicators)
@@ -195,16 +377,17 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 		}
 
 		nodeMetrics = append(nodeMetrics, NodeMetrics{
-			Name:            item.Metadata.Name,
-			CPUUsage:        item.Usage.CPU,
-			MemoryUsage:     item.Usage.Memory,
-			CPUCapacity:     cpuCapacity.String(),
-			MemoryCapacity:  memCapacity.String(),
-			CPUPercent:      cpuPercent,
-			MemoryPercent:   memPercent,
-			DiskCapacity:    diskCapacity.Value(),
-			DiskAllocatable: diskAllocatable.Value(),
-			Conditions:      conditions,
+			Name:           item.Metadata.Name,
+			CPUUsage:       item.Usage.CPU,
+			MemoryUsage:    item.Usage.Memory,
+			CPUCapacity:    cpuCapacity.String(),
+			MemoryCapacity: memCapacity.String(),
+			CPUPercent:     cpuPercent,
+			MemoryPercent:  memPercent,
+			DiskCapacity:   diskCapacity,
+			DiskUsage:      diskUsage,
+			DiskPercent:    diskPercent,
+			Conditions:     conditions,
 		})
 	}
 
@@ -282,4 +465,18 @@ func sendClusterInfo(conn *websocket.Conn, mu *sync.Mutex, clientset *kubernetes
 	mu.Lock()
 	defer mu.Unlock()
 	return conn.WriteJSON(info)
+}
+
+func handlePodMetrics(w http.ResponseWriter, r *http.Request, clientset *kubernetes.Clientset) {
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	info, err := getPodMetrics(ctx, clientset)
+	if err != nil {
+		http.Error(w, "Failed to get pod metrics: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
 }
