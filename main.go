@@ -91,21 +91,38 @@ func main() {
 		os.Exit(1)
 	}
 
-	http.HandleFunc("/cluster-info", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cluster-info", func(w http.ResponseWriter, r *http.Request) {
 		handleClusterInfo(w, r, clientset)
 	})
 
-	http.HandleFunc("/ws/cluster-info", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ws/cluster-info", func(w http.ResponseWriter, r *http.Request) {
 		handleClusterInfoWS(w, r, clientset)
 	})
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
 
+	// CORS middleware
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	slog.Info("Cluster monitor listening", "addr", *addr)
-	if err := http.ListenAndServe(*addr, nil); err != nil {
+	if err := http.ListenAndServe(*addr, corsHandler); err != nil {
 		slog.Error("HTTP server failed", "error", err)
 		os.Exit(1)
 	}
