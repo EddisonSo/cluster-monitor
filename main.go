@@ -168,33 +168,42 @@ func getPodMetrics(ctx context.Context, clientset *kubernetes.Clientset) (*PodMe
 		}
 	}
 
-	// Fetch kubelet stats from each node to get disk usage per pod
+	// Fetch kubelet stats from each node in parallel to get disk usage per pod
 	podDiskUsage := make(map[string]int64) // key: "namespace/name"
+	var podDiskMu sync.Mutex
+	var wg sync.WaitGroup
 	for nodeName := range nodeSet {
-		data, err := clientset.RESTClient().
-			Get().
-			AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
-			DoRaw(ctx)
-		if err != nil {
-			slog.Warn("Failed to get kubelet stats", "node", nodeName, "error", err)
-			continue
-		}
-
-		var stats kubeletStats
-		if err := json.Unmarshal(data, &stats); err != nil {
-			continue
-		}
-
-		for _, podStat := range stats.Pods {
-			if podStat.PodRef.Namespace != coreServicesNamespace {
-				continue
+		wg.Add(1)
+		go func(nodeName string) {
+			defer wg.Done()
+			data, err := clientset.RESTClient().
+				Get().
+				AbsPath("/api/v1/nodes/" + nodeName + "/proxy/stats/summary").
+				DoRaw(ctx)
+			if err != nil {
+				slog.Warn("Failed to get kubelet stats", "node", nodeName, "error", err)
+				return
 			}
-			key := podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
-			if podStat.EphemeralStorage != nil {
-				podDiskUsage[key] = podStat.EphemeralStorage.UsedBytes
+
+			var stats kubeletStats
+			if err := json.Unmarshal(data, &stats); err != nil {
+				return
 			}
-		}
+
+			podDiskMu.Lock()
+			for _, podStat := range stats.Pods {
+				if podStat.PodRef.Namespace != coreServicesNamespace {
+					continue
+				}
+				key := podStat.PodRef.Namespace + "/" + podStat.PodRef.Name
+				if podStat.EphemeralStorage != nil {
+					podDiskUsage[key] = podStat.EphemeralStorage.UsedBytes
+				}
+			}
+			podDiskMu.Unlock()
+		}(nodeName)
 	}
+	wg.Wait()
 
 	// Build response
 	var podMetrics []PodMetrics
@@ -329,6 +338,27 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 		nodeInfo[nodes.Items[i].Name] = &nodes.Items[i]
 	}
 
+	// Fetch disk stats from all nodes in parallel
+	type diskStats struct {
+		capacity int64
+		usage    int64
+	}
+	diskStatsMap := make(map[string]diskStats)
+	var diskMu sync.Mutex
+	var wg sync.WaitGroup
+	for _, item := range metricsResponse.Items {
+		wg.Add(1)
+		go func(nodeName string) {
+			defer wg.Done()
+			if cap, used, err := getNodeDiskStats(ctx, clientset, nodeName); err == nil {
+				diskMu.Lock()
+				diskStatsMap[nodeName] = diskStats{capacity: cap, usage: used}
+				diskMu.Unlock()
+			}
+		}(item.Metadata.Name)
+	}
+	wg.Wait()
+
 	// Build response
 	var nodeMetrics []NodeMetrics
 	for _, item := range metricsResponse.Items {
@@ -353,12 +383,12 @@ func getClusterInfo(ctx context.Context, clientset *kubernetes.Clientset) (*Clus
 			memPercent = float64(memUsage.Value()) / float64(memCapacity.Value()) * 100
 		}
 
-		// Fetch disk stats from kubelet
+		// Get disk stats from parallel fetch
 		var diskCapacity, diskUsage int64
 		var diskPercent float64
-		if cap, used, err := getNodeDiskStats(ctx, clientset, item.Metadata.Name); err == nil {
-			diskCapacity = cap
-			diskUsage = used
+		if ds, ok := diskStatsMap[item.Metadata.Name]; ok {
+			diskCapacity = ds.capacity
+			diskUsage = ds.usage
 			if diskCapacity > 0 {
 				diskPercent = float64(diskUsage) / float64(diskCapacity) * 100
 			}
