@@ -44,12 +44,15 @@ type ClusterInfo struct {
 }
 
 type PodMetrics struct {
-	Name        string `json:"name"`
-	Namespace   string `json:"namespace"`
-	Node        string `json:"node"`
-	CPUUsage    int64  `json:"cpu_usage"`
-	MemoryUsage int64  `json:"memory_usage"`
-	DiskUsage   int64  `json:"disk_usage"`
+	Name           string `json:"name"`
+	Namespace      string `json:"namespace"`
+	Node           string `json:"node"`
+	CPUUsage       int64  `json:"cpu_usage"`        // millicores
+	MemoryUsage    int64  `json:"memory_usage"`     // bytes
+	DiskUsage      int64  `json:"disk_usage"`       // bytes
+	CPUCapacity    int64  `json:"cpu_capacity"`     // millicores (node capacity)
+	MemoryCapacity int64  `json:"memory_capacity"`  // bytes (node capacity)
+	DiskCapacity   int64  `json:"disk_capacity"`    // bytes (node capacity)
 }
 
 type PodMetricsInfo struct {
@@ -445,6 +448,26 @@ func fetchPodMetrics(clientset *kubernetes.Clientset, cache *MetricsCache) {
 		return
 	}
 
+	// Fetch nodes for capacity information
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		slog.Error("Failed to list nodes", "error", err)
+		return
+	}
+
+	type nodeCapacity struct {
+		cpuMillis  int64
+		memBytes   int64
+		diskBytes  int64
+	}
+	nodeCapacities := make(map[string]nodeCapacity)
+	for _, node := range nodes.Items {
+		nodeCapacities[node.Name] = nodeCapacity{
+			cpuMillis: node.Status.Capacity.Cpu().MilliValue(),
+			memBytes:  node.Status.Capacity.Memory().Value(),
+		}
+	}
+
 	podToNode := make(map[string]string)
 	for _, pod := range pods.Items {
 		podToNode[pod.Name] = pod.Spec.NodeName
@@ -457,8 +480,9 @@ func fetchPodMetrics(clientset *kubernetes.Clientset, cache *MetricsCache) {
 		}
 	}
 
-	// Fetch kubelet stats in parallel
+	// Fetch kubelet stats in parallel for disk usage and disk capacity
 	podDiskUsage := make(map[string]int64)
+	nodeDiskCapacity := make(map[string]int64)
 	var podDiskMu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -480,6 +504,7 @@ func fetchPodMetrics(clientset *kubernetes.Clientset, cache *MetricsCache) {
 			}
 
 			podDiskMu.Lock()
+			nodeDiskCapacity[nodeName] = stats.Node.Fs.CapacityBytes
 			for _, podStat := range stats.Pods {
 				if podStat.PodRef.Namespace != coreServicesNamespace {
 					continue
@@ -504,14 +529,29 @@ func fetchPodMetrics(clientset *kubernetes.Clientset, cache *MetricsCache) {
 			totalMemory += mem.Value()
 		}
 
+		nodeName := podToNode[item.Metadata.Name]
 		key := item.Metadata.Namespace + "/" + item.Metadata.Name
+
+		// Get node capacity for this pod
+		var cpuCap, memCap, diskCap int64
+		if cap, ok := nodeCapacities[nodeName]; ok {
+			cpuCap = cap.cpuMillis * 1000000 // convert to nanocores like usage
+			memCap = cap.memBytes
+		}
+		if dc, ok := nodeDiskCapacity[nodeName]; ok {
+			diskCap = dc
+		}
+
 		podMetrics = append(podMetrics, PodMetrics{
-			Name:        item.Metadata.Name,
-			Namespace:   item.Metadata.Namespace,
-			Node:        podToNode[item.Metadata.Name],
-			CPUUsage:    totalCPU,
-			MemoryUsage: totalMemory,
-			DiskUsage:   podDiskUsage[key],
+			Name:           item.Metadata.Name,
+			Namespace:      item.Metadata.Namespace,
+			Node:           nodeName,
+			CPUUsage:       totalCPU,
+			MemoryUsage:    totalMemory,
+			DiskUsage:      podDiskUsage[key],
+			CPUCapacity:    cpuCap,
+			MemoryCapacity: memCap,
+			DiskCapacity:   diskCap,
 		})
 	}
 
